@@ -289,7 +289,7 @@ schema = (extractor.create_schema()
         .field("effective_date", dtype="str")
         .field("monthly_fee", dtype="str")
         .field("term_length", dtype="str")
-        .field("renewal::[automatic|manual|none]::str::Contract renewal type")
+        .field("renewal", dtype="str", choices=["automatic", "manual", "none"])
         .field("termination_notice", dtype="str")
 )
 
