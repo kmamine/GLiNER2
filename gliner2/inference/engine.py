@@ -1118,6 +1118,9 @@ class GLiNER2(Extractor):
                         elif threshold == 0.0 and best_choice:
                             # Special case: threshold is 0, so include best match regardless
                             instance_data[field_name] = best_choice
+                        else:
+                            # Set None for str fields with no valid choice
+                            instance_data[field_name] = None
                 else:
                     # Regular span extraction
                     spans = self._find_valid_spans(
@@ -1130,8 +1133,21 @@ class GLiNER2(Extractor):
                             instance_data[field_name] = self._format_span_list(spans)
                         else:  # "str"
                             instance_data[field_name] = spans[0][0]
+                    else:
+                        # Set None for str fields, empty list for list fields
+                        if dtype == "list":
+                            instance_data[field_name] = []
+                        else:  # "str"
+                            instance_data[field_name] = None
 
-            if instance_data:
+            # Only add instance if it has at least one non-empty field
+            has_content = False
+            for value in instance_data.values():
+                if value is not None and value != []:
+                    has_content = True
+                    break
+
+            if has_content:
                 instances.append(instance_data)
 
         return instances

@@ -1,7 +1,7 @@
 import copy
 import random
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union, Iterator
 
 import torch
 from transformers import AutoTokenizer
@@ -16,14 +16,41 @@ class TokenSplitterBase():
 
 
 class WhitespaceTokenSplitter(TokenSplitterBase):
-    def __init__(self):
-        self.whitespace_pattern = re.compile(r'\w+(?:[-_]\w+)*|\S')
+    """
+    One‑pass tokenizer that treats…
+      • URLs   → single token
+      • Emails → single token
+      • @handles → single token
+      • Words with optional -/_ inside → single token
+      • Any other non‑space char → single token
+    Yields (token, start, end) like nltk.tokenize.RegexTokenizer.
+    """
 
-    def __call__(self, text, lower=True):
+    __slots__ = ()                     # tiny memory footprint
+
+    _PATTERN = re.compile(             # pre‑compiled once at import time
+        r"""
+        (?:https?://[^\s]+|            # URL with scheme
+           www\.[^\s]+)                # or bare www.
+        |                              # ───────────────────
+        [a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}   # e‑mail
+        |                              # ───────────────────
+        @[a-z0-9_]+                    # social handle (@foo_bar)
+        |                              # ───────────────────
+        \w+(?:[-_]\w+)*                # classic word (foo-bar_baz)
+        |                              # ───────────────────
+        \S                             # fallback single char
+        """,
+        re.VERBOSE | re.IGNORECASE,
+    )
+
+    def __call__(
+        self, text: str, lower: bool = True
+    ) -> Iterator[Tuple[str, int, int]]:
         if lower:
             text = text.lower()
-        for match in self.whitespace_pattern.finditer(text):
-            yield match.group(), match.start(), match.end()
+        for m in self._PATTERN.finditer(text):
+            yield m.group(), m.start(), m.end()
 
 
 class SamplingConfig:
@@ -91,6 +118,7 @@ class SamplingConfig:
         self.synthetic_label_prob = synthetic_label_prob
         self.include_true_label_prob = include_true_label_prob
         self.max_num_labels = max_num_labels
+
 
 class SchemaTransformer:
     def __init__(self, model_name: str = None, tokenizer=None, sampling_config: SamplingConfig = None):
@@ -193,14 +221,19 @@ class SchemaTransformer:
 
         return prefix_tokens
 
-    @staticmethod
-    def tokenize_text(text: str, lower: bool = True) -> List[str]:
+    ## @staticmethod
+    def tokenize_text(self, text: str, lower: bool = True) -> List[str]:
         """
         Tokenize the input text into a list of tokens (words/punctuation).
         """
-        if lower:
-            text = text.lower()
-        return re.findall(r'\w+(?:[-_]\w+)*|\S', text)
+        # if lower:
+        #     text = text.lower()
+        # return re.findall(r'\w+(?:[-_]\w+)*|\S', text)
+        # use self.word_splitter to tokenize the text
+        # tokens = []
+        # for token, start, end in WhitespaceTokenSplitter()(text, lower=lower):
+        #     tokens.append(token)
+        return [tok for tok, _, _ in self.word_splitter(text, lower=lower)]
 
     def transform_schema(
             self,
@@ -550,7 +583,7 @@ class SchemaTransformer:
                     # 3) Still preserve the true label with the same logic as before:
                     if random.random() < sampling.include_true_label_prob:
                         true_label = schema["classifications"][l].get("true_label", [])
-                        #if true_label not in labels:
+                        # if true_label not in labels:
                         if isinstance(true_label, list):
                             for true_label_item in true_label:
                                 if true_label_item not in labels:

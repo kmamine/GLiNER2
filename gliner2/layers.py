@@ -130,7 +130,7 @@ class CountLSTMv2(nn.Module):
     def __init__(self, hidden_size, max_count=20):
         super().__init__()
         self.hidden_size = hidden_size
-        self.max_count  = max_count
+        self.max_count = max_count
         self.pos_embedding = nn.Embedding(max_count, hidden_size)
         self.gru = nn.GRU(hidden_size, hidden_size)
         self.transformer = DownscaledTransformer(
@@ -142,31 +142,24 @@ class CountLSTMv2(nn.Module):
         )
 
     # NOTE: gold_count_val is now a 0-D Tensor, not a Python int
-    def forward(self, pc_emb: torch.Tensor, gold_count_val: torch.Tensor) -> torch.Tensor:
-        M, D = pc_emb.size()                              # symbolic sizes
+    def forward(self, pc_emb: torch.Tensor, gold_count_val: int) -> torch.Tensor:
+        M, D = pc_emb.size()  # symbolic sizes
 
         # clamp without dropping to Python
-        gold_count_val = torch.clamp(gold_count_val, max=self.max_count)
+        gold_count_val = min(gold_count_val, self.max_count)
 
         # build the *full* index vector once, then slice – ONNX supports both ops
-        full_idx   = torch.arange(self.max_count, device=pc_emb.device)
-        count_idx  = full_idx[:gold_count_val]            # (gold_count_val,)
+        full_idx = torch.arange(self.max_count, device=pc_emb.device)
+        count_idx = full_idx[:gold_count_val]  # (gold_count_val,)
 
-        pos_seq = self.pos_embedding(count_idx)           # (gold_count_val, D)
+        pos_seq = self.pos_embedding(count_idx)  # (gold_count_val, D)
         pos_seq = pos_seq.unsqueeze(1).expand(-1, M, -1)  # (gold_count_val, M, D)
 
-        h0 = pc_emb.unsqueeze(0)                          # (1, M, D)
-        output, _ = self.gru(pos_seq, h0)                 # (gold_count_val, M, D)
+        h0 = pc_emb.unsqueeze(0)  # (1, M, D)
+        output, _ = self.gru(pos_seq, h0)  # (gold_count_val, M, D)
 
         pc_broadcast = pc_emb.unsqueeze(0).expand_as(output)
         return self.transformer(output + pc_broadcast)
-
-
-"""test
-layer = DownscaledTransformer(128, 256)
-x = torch.randn(10, 32, 128)  # (L, M, input_size)
-out = layer(x)
-"""
 
 
 class CountLSTMoE(nn.Module):

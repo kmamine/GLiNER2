@@ -116,9 +116,6 @@ class Extractor(PreTrainedModel):
     # Original Methods
     # ---------------------------
     def compute_span_rep(self, token_embeddings: torch.Tensor) -> dict:
-        """
-        Compute span representations from token embeddings.
-        """
         text_length = len(token_embeddings)
         device = next(self.encoder.parameters()).device
 
@@ -128,14 +125,23 @@ class Extractor(PreTrainedModel):
                 if i + j < text_length:
                     spans_idx.append((i, i + j))
                 else:
-                    spans_idx.append((0, 0))
-        spans_idx = torch.LongTensor([spans_idx]).to(device)
-        span_mask = spans_idx[:, :, 1] >= (text_length - 1)
+                    spans_idx.append((-1, -1))  # Explicitly mark invalid spans
+
+        spans_idx = torch.LongTensor([spans_idx]).to(device)  # shape: [1, num_spans, 2]
+
+        # Mask invalid spans (where either start or end == -1)
+        span_mask = (spans_idx[:, :, 0] == -1) | (spans_idx[:, :, 1] == -1)
         span_mask = span_mask.to(device)
 
-        spans_idx = spans_idx * (~span_mask).long().unsqueeze(-1)
+        # Replace invalid spans with dummy (0, 0) for safe indexing
+        safe_spans_idx = torch.where(
+            span_mask.unsqueeze(-1),
+            torch.zeros_like(spans_idx),
+            spans_idx
+        )
 
-        span_rep = self.span_rep(token_embeddings.unsqueeze(0), spans_idx).squeeze(0)
+        # Compute span representations (batch size = 1)
+        span_rep = self.span_rep(token_embeddings.unsqueeze(0), safe_spans_idx).squeeze(0)  # [num_spans, hidden_dim]
 
         return {
             "span_rep": span_rep,
@@ -165,33 +171,37 @@ class Extractor(PreTrainedModel):
 
         # --- DYNAMIC POSITIVE WEIGHTING ---
         # Calculate the ratio of negative/positive examples for current batch
-        num_positives = (binary_labels == 1).sum()
-        num_negatives = (binary_labels == 0).sum()
+        # num_positives = (binary_labels == 1).sum()
+        # num_negatives = (binary_labels == 0).sum()
         # To avoid division by zero
-        pos_weight = (num_negatives / (num_positives + 1e-6)).clamp(min=1.0, max=5.0)
+        # pos_weight = (num_negatives / (num_positives + 1e-6)).clamp(min=1.0, max=5.0)
 
         # Create BCE loss with batch-specific pos_weight
         loss_fn = nn.BCEWithLogitsLoss(reduction="sum")  # pos_weight=pos_weight)
 
         return loss_fn(logits.squeeze(-1), binary_labels)
 
-    def compute_struct_loss(self, h, pc_embeddings, structures, span_mask):
+    def compute_struct_loss(self, h, pc_embeddings, structures, span_mask,
+                            masking_rate=0.5):
         """
-        Computes the structure loss for hierarchical schemas in a vectorized manner.
+        Enhanced structure loss with random negative span masking to improve recall
+        by addressing the unlabeled entity problem.
+
+        Args:
+            h: Span representations
+            pc_embeddings: Schema embeddings
+            structures: Ground truth structure labels
+            span_mask: Mask for valid spans
+            masking_rate: Probability of masking negative spans (0.0 to 1.0)
         """
-        # Predict count and compute count loss.
         gold_count_val = min(structures[0], 19)
-
-        # [gold_count_val, M, hidden_size]
         struct_proj = self.count_embed(pc_embeddings[1:], gold_count_val)
-
-        # Compute scores using batched einsum.
         scores = torch.einsum('lkd,bpd->bplk', h, struct_proj)
 
-        # Create label tensor matching the shape of scores.
+        # Create label tensor matching the shape of scores
         labs = torch.zeros_like(scores)
         for i in range(gold_count_val):
-            gold_spans = structures[1][i]  # List of gold span annotations for gold count i.
+            gold_spans = structures[1][i]
             for k, span in enumerate(gold_spans):
                 if span is None or span == (-1, -1):
                     continue
@@ -208,12 +218,29 @@ class Extractor(PreTrainedModel):
                         width = end - start
                         if 0 <= start < scores.shape[2] and 0 <= width < scores.shape[3]:
                             labs[i, k, start, width] = 1
-                else:
-                    raise ValueError("Invalid gold span format")
 
+        # Apply random masking to negative spans only
+        if masking_rate > 0.0:
+            # Identify negative spans (where labels are 0)
+            negative_spans = (labs == 0)
+
+            # Generate random mask for negative spans
+            random_mask = torch.rand_like(scores) < masking_rate
+
+            # Apply masking only to negative spans
+            spans_to_mask = negative_spans & random_mask
+
+            # Create loss computation mask (1 = compute loss, 0 = ignore)
+            loss_computation_mask = (~spans_to_mask).float()
+        else:
+            loss_computation_mask = torch.ones_like(scores)
+
+        # Compute loss with masking applied
         loss_struct = F.binary_cross_entropy_with_logits(scores, labs, reduction="none")
+        loss_struct = loss_struct * loss_computation_mask
         loss_struct = loss_struct.view(loss_struct.shape[0], loss_struct.shape[1], -1) * (~span_mask[0]).float()
         loss_struct = loss_struct.sum()
+
         return loss_struct
 
     def process_record(self, record: dict) -> dict:
