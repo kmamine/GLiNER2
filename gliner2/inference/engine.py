@@ -34,10 +34,84 @@ Complex multi-task extraction:
     >>> results = extractor.extract(review_text, schema)
 """
 
-from typing import Any, Dict, List, Optional, Literal, Union, Tuple
+from __future__ import annotations
+
+import re
 from collections import OrderedDict
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Union, Tuple
+from typing import Pattern, Literal
+
 import torch
 from gliner2.model import Extractor
+
+
+@dataclass
+class RegexValidator:
+    """
+    Regex-based span filter.
+
+    Parameters
+    ----------
+    pattern : str | Pattern[str]
+        The regex to apply. If a pre-compiled Pattern is supplied, its flags
+        are preserved.
+    mode : Literal["full", "partial"], default="full"
+        * "full":  `re.fullmatch`
+        * "partial": `re.search`
+    exclude : bool, default=False
+        * False → keep only spans that match.
+        * True  → drop spans that match.
+    flags : int, default=re.IGNORECASE
+        Standard `re` flags to apply **when pattern is a string**.
+    """
+    pattern: str | Pattern[str]
+    mode: Literal["full", "partial"] = "full"
+    exclude: bool = False
+    flags: int = re.IGNORECASE
+    _compiled: Pattern[str] = field(init=False, repr=False)
+
+    # --------------------------------------------------------------------- #
+    # Dunders
+    # --------------------------------------------------------------------- #
+    def __post_init__(self) -> None:  # noqa: D401
+        if self.mode not in {"full", "partial"}:
+            raise ValueError(f"mode must be 'full' or 'partial', got {self.mode!r}")
+        try:
+            compiled = (
+                self.pattern
+                if isinstance(self.pattern, re.Pattern)
+                else re.compile(self.pattern, self.flags)
+            )
+        except re.error as err:
+            raise ValueError(f"Invalid regex: {self.pattern!r}") from err
+
+        object.__setattr__(self, "_compiled", compiled)
+
+    def __call__(self, text: str) -> bool:  # noqa: D401
+        """Alias for `validate` so you can use the instance like a function."""
+        return self.validate(text)
+
+    # --------------------------------------------------------------------- #
+    # Public API
+    # --------------------------------------------------------------------- #
+    def validate(self, text: str) -> bool:  # noqa: D401
+        """Return **True** if the span passes this validator."""
+        matcher = (
+            self._compiled.fullmatch if self.mode == "full" else self._compiled.search
+        )
+        matched = matcher(text) is not None
+        return not matched if self.exclude else matched
+
+    # --------------------------------------------------------------------- #
+    # Helpers
+    # --------------------------------------------------------------------- #
+    def describe(self) -> str:
+        neg = "exclude" if self.exclude else "include"
+        return f"<RegexValidator {neg} /{self._compiled.pattern}/ ({self.mode})>"
+
+    def __repr__(self) -> str:  # noqa: D401
+        return self.describe()
 
 
 class StructureBuilder:
@@ -63,7 +137,8 @@ class StructureBuilder:
             dtype: Literal["str", "list"] = "list",
             choices: Optional[List[str]] = None,
             description: Optional[str] = None,
-            threshold: Optional[float] = None
+            threshold: Optional[float] = None,
+            validators: Optional[List[RegexValidator]] = None
     ) -> 'StructureBuilder':
         """
         Add a field to the structured data.
@@ -86,6 +161,9 @@ class StructureBuilder:
         threshold : float, optional
             Custom confidence threshold for this field (overrides default).
             Values must be between 0 and 1.
+        validators : List[RegexValidator], optional
+            List of regex validators to filter extracted spans.
+            All validators must pass for a span to be included.
 
         Returns
         -------
@@ -111,6 +189,11 @@ class StructureBuilder:
         >>> # High-precision field
         >>> builder.field("email", dtype="str", threshold=0.9,
         ...               description="Contact email address")
+
+        >>> # Field with regex validation
+        >>> builder.field("email", dtype="str", validators=[
+        ...     RegexValidator(r"^[\w\.-]+@[\w\.-]+\.\w+$")
+        ... ])
         """
         # Store field in schema format
         self.fields[name] = {"value": "", "choices": choices} if choices else ""
@@ -119,8 +202,8 @@ class StructureBuilder:
         if description:
             self.descriptions[name] = description
 
-        # Store metadata including threshold
-        self.schema._store_field_metadata(self.parent, name, dtype, threshold, choices)
+        # Store metadata including threshold and validators
+        self.schema._store_field_metadata(self.parent, name, dtype, threshold, choices, validators)
         return self
 
     def _auto_finish(self):
@@ -158,14 +241,14 @@ class Schema:
             "entity_descriptions": OrderedDict()  # Preserve description order
         }
         # Store metadata for thresholds and types
-        self._field_metadata = {}  # "parent.field" -> {dtype, threshold, choices}
+        self._field_metadata = {}  # "parent.field" -> {dtype, threshold, choices, validators}
         self._entity_metadata = {}  # "entity_name" -> {dtype, threshold}
         self._field_orders = {}  # "parent" -> [field1, field2, ...]
         self._entity_order = []  # [entity1, entity2, ...]
         self._active_structure_builder = None  # Track active structure builder
 
     def _store_field_metadata(self, parent: str, field: str, dtype: str, threshold: Optional[float],
-                              choices: Optional[List[str]]):
+                              choices: Optional[List[str]], validators: Optional[List[RegexValidator]] = None):
         """Store field configuration."""
         # Validate threshold if provided
         if threshold is not None:
@@ -173,7 +256,12 @@ class Schema:
                 raise ValueError(f"Threshold must be between 0 and 1, got {threshold}")
 
         key = f"{parent}.{field}"
-        self._field_metadata[key] = {"dtype": dtype, "threshold": threshold, "choices": choices}
+        self._field_metadata[key] = {
+            "dtype": dtype,
+            "threshold": threshold,
+            "choices": choices,
+            "validators": validators or [],
+        }
 
     def _store_entity_metadata(self, entity: str, dtype: str, threshold: Optional[float]):
         """Store entity configuration."""
@@ -1064,6 +1152,7 @@ class GLiNER2(Extractor):
                 if threshold is None:
                     threshold = default_threshold
                 dtype = metadata.get("dtype", "list")
+                validators = metadata.get("validators")
 
                 # Check if this is a classification field
                 if field_key in classification_fields:
@@ -1126,6 +1215,14 @@ class GLiNER2(Extractor):
                     spans = self._find_valid_spans(
                         scores[field_idx], threshold, record, outputs, text_len
                     )
+
+                    # Apply regex validators if present
+                    if validators:
+                        spans = [
+                            (text, conf, start, end)
+                            for text, conf, start, end in spans
+                            if all(v.validate(text) for v in validators)
+                        ]
 
                     # Format and store results
                     if spans:
