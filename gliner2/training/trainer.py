@@ -66,6 +66,12 @@ from gliner2.training.data import (
     DataFormat, detect_data_format, DataLoader_Factory, TrainDataInput
 )
 
+# Import LoRA for parameter-efficient fine-tuning
+from gliner2.training.lora import (
+    LoRAConfig, apply_lora_to_model, get_lora_parameters,
+    merge_lora_weights, count_lora_parameters, print_lora_info
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -120,6 +126,9 @@ class TrainingConfig:
         Maximum checkpoints to keep.
     save_best : bool
         Save best model based on metric.
+    save_optimizer_state : bool
+        Save optimizer/scheduler state for resuming training (default: True).
+        Set to False to save only model weights (smaller checkpoints).
     metric_for_best : str
         Metric to use for best model selection.
     greater_is_better : bool
@@ -169,6 +178,7 @@ class TrainingConfig:
     save_steps: int = 500
     save_total_limit: int = 3
     save_best: bool = True
+    save_optimizer_state: bool = True
     metric_for_best: str = "eval_loss"
     greater_is_better: bool = False
     eval_strategy: str = "epoch"
@@ -196,6 +206,13 @@ class TrainingConfig:
     max_eval_samples: int = -1
     validate_data: bool = True
     strict_validation: bool = False
+    
+    # LoRA Configuration (Parameter-Efficient Fine-Tuning)
+    use_lora: bool = False
+    lora_r: int = 8
+    lora_alpha: float = 16.0
+    lora_dropout: float = 0.0
+    lora_target_modules: List[str] = field(default_factory=lambda: ["query", "key", "value"])
 
     def __post_init__(self):
         if self.fp16 and self.bf16:
@@ -204,6 +221,32 @@ class TrainingConfig:
             logger.warning("bf16 not supported, falling back to fp16")
             self.bf16 = False
             self.fp16 = True
+        
+        # Validate logging_steps
+        if self.logging_steps <= 0:
+            raise ValueError(f"logging_steps must be > 0, got {self.logging_steps}")
+        
+        # Validate batch_size
+        if self.batch_size <= 0:
+            raise ValueError(f"batch_size must be > 0, got {self.batch_size}")
+        
+        if self.eval_batch_size <= 0:
+            raise ValueError(f"eval_batch_size must be > 0, got {self.eval_batch_size}")
+        
+        # Validate gradient_accumulation_steps
+        if self.gradient_accumulation_steps <= 0:
+            raise ValueError(f"gradient_accumulation_steps must be > 0, got {self.gradient_accumulation_steps}")
+        
+        # Validate LoRA configuration
+        if self.use_lora:
+            if self.lora_r <= 0:
+                raise ValueError(f"lora_r must be > 0, got {self.lora_r}")
+            if self.lora_alpha <= 0:
+                raise ValueError(f"lora_alpha must be > 0, got {self.lora_alpha}")
+            if not 0 <= self.lora_dropout < 1:
+                raise ValueError(f"lora_dropout must be in [0, 1), got {self.lora_dropout}")
+            if not self.lora_target_modules:
+                raise ValueError("lora_target_modules cannot be empty when use_lora=True")
 
     @property
     def effective_batch_size(self) -> int:
@@ -487,6 +530,10 @@ class GLiNER2Trainer:
         self.scheduler = None
         self.scaler = None
         self.wandb_run = None
+        
+        # LoRA state
+        self.lora_layers = {}
+        self._setup_lora()
 
     def _setup_seed(self):
         seed = self.config.seed
@@ -560,9 +607,121 @@ class GLiNER2Trainer:
             except ImportError:
                 logger.warning("wandb not available")
 
+    def _setup_lora(self):
+        """Setup LoRA for parameter-efficient fine-tuning if enabled."""
+        if not self.config.use_lora:
+            logger.info("LoRA is disabled")
+            return
+        
+        logger.info("Setting up LoRA for parameter-efficient fine-tuning...")
+        
+        # Create LoRA config
+        lora_config = LoRAConfig(
+            enabled=True,
+            r=self.config.lora_r,
+            alpha=self.config.lora_alpha,
+            dropout=self.config.lora_dropout,
+            target_modules=self.config.lora_target_modules,
+        )
+        
+        # Apply LoRA to encoder only
+        self.model, self.lora_layers = apply_lora_to_model(
+            model=self.model,
+            config=lora_config,
+            encoder_only=True,
+        )
+        
+        # Print LoRA information
+        if self.is_main_process:
+            print_lora_info(self.model, lora_config)
+        
+        # Log parameter counts
+        lora_params, total_params, percentage = count_lora_parameters(self.model)
+        logger.info(
+            f"LoRA setup complete: {lora_params:,} trainable params "
+            f"out of {total_params:,} total ({percentage:.2f}%)"
+        )
+
     @property
     def is_main_process(self) -> bool:
         return self.config.local_rank <= 0
+
+    @staticmethod
+    def _safe_divide(numerator: float, denominator: float, default: float = 0.0) -> float:
+        """Safely divide two numbers, returning default if denominator is zero."""
+        if denominator == 0:
+            return default
+        return numerator / denominator
+    
+    def _validate_training_setup(self, train_dataset: ExtractorDataset, eval_dataset: Optional[ExtractorDataset]):
+        """Validate training setup and raise informative errors for edge cases."""
+        # Check if dataset is empty
+        if len(train_dataset) == 0:
+            raise ValueError("Training dataset is empty. Please provide at least one training example.")
+        
+        # Check if dataset is smaller than batch size
+        if len(train_dataset) < self.config.batch_size:
+            logger.warning(
+                f"Training dataset size ({len(train_dataset)}) is smaller than batch_size "
+                f"({self.config.batch_size}). Adjusting batch_size to {len(train_dataset)}."
+            )
+            # We'll handle this in _create_dataloader by adjusting drop_last
+        
+        # Check early stopping configuration
+        if self.config.early_stopping:
+            if eval_dataset is None:
+                raise ValueError(
+                    "early_stopping is enabled but no eval_data provided. "
+                    "Please provide eval_data or disable early_stopping."
+                )
+            if len(eval_dataset) == 0:
+                raise ValueError("Evaluation dataset is empty but early_stopping is enabled.")
+        
+        # Check eval strategy configuration
+        if self.config.eval_strategy == "steps" and eval_dataset is None:
+            logger.warning(
+                "eval_strategy='steps' but no eval_data provided. "
+                "Evaluation will be skipped."
+            )
+        
+        # Warn about very small datasets
+        if len(train_dataset) < self.config.gradient_accumulation_steps:
+            logger.warning(
+                f"Training dataset size ({len(train_dataset)}) is smaller than "
+                f"gradient_accumulation_steps ({self.config.gradient_accumulation_steps}). "
+                f"Training may not work as expected."
+            )
+    
+    def _flush_gradients(self) -> Optional[float]:
+        """Flush accumulated gradients at the end of epoch if incomplete cycle exists."""
+        # Check if there are accumulated gradients
+        has_gradients = False
+        for param in self.model.parameters():
+            if param.grad is not None and param.grad.abs().sum() > 0:
+                has_gradients = True
+                break
+        
+        if not has_gradients:
+            return None
+        
+        # Apply the accumulated gradients
+        if self.config.fp16:
+            self.scaler.unscale_(self.optimizer)
+        
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+        
+        if self.config.fp16:
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            self.optimizer.step()
+        
+        self.scheduler.step()
+        self.optimizer.zero_grad()
+        self.global_step += 1
+        
+        logger.info(f"Flushed incomplete gradient accumulation cycle at end of epoch (grad_norm: {grad_norm:.2f})")
+        return grad_norm
 
     def _prepare_data(self, data: TrainDataInput, is_train: bool = True) -> ExtractorDataset:
         """Convert any supported data format to ExtractorDataset."""
@@ -584,24 +743,70 @@ class GLiNER2Trainer:
         )
 
     def _create_optimizer(self) -> AdamW:
-        encoder_params = []
-        task_params = []
-        for name, param in self.model.named_parameters():
-            if not param.requires_grad:
-                continue
-            if "encoder" in name:
-                encoder_params.append(param)
-            else:
+        """Create optimizer with appropriate parameters based on LoRA configuration."""
+        
+        if self.config.use_lora:
+            # When using LoRA: train LoRA parameters + task-specific heads
+            lora_params = get_lora_parameters(self.model)
+            task_params = []
+            
+            # Get task-specific parameters (not in encoder)
+            for name, param in self.model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                # Skip encoder parameters (they're frozen except LoRA)
+                if "encoder" in name:
+                    continue
                 task_params.append(param)
+            
+            # Use task_lr for both LoRA and task parameters
+            param_groups = []
+            if lora_params:
+                param_groups.append({
+                    "params": lora_params,
+                    "lr": self.config.task_lr,
+                    "weight_decay": self.config.weight_decay
+                })
+            if task_params:
+                param_groups.append({
+                    "params": task_params,
+                    "lr": self.config.task_lr,
+                    "weight_decay": self.config.weight_decay
+                })
+            
+            if not param_groups:
+                raise ValueError("No trainable parameters found. Check LoRA configuration.")
+            
+            logger.info(
+                f"Optimizer: LoRA params={len(lora_params)}, "
+                f"Task params={len(task_params)}, LR={self.config.task_lr}"
+            )
+            
+            return AdamW(
+                param_groups,
+                betas=(self.config.adam_beta1, self.config.adam_beta2),
+                eps=self.config.adam_epsilon,
+            )
+        else:
+            # Normal training: separate LRs for encoder and task-specific layers
+            encoder_params = []
+            task_params = []
+            for name, param in self.model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if "encoder" in name:
+                    encoder_params.append(param)
+                else:
+                    task_params.append(param)
 
-        return AdamW(
-            [
-                {"params": encoder_params, "lr": self.config.encoder_lr, "weight_decay": self.config.weight_decay},
-                {"params": task_params, "lr": self.config.task_lr, "weight_decay": self.config.weight_decay},
-            ],
-            betas=(self.config.adam_beta1, self.config.adam_beta2),
-            eps=self.config.adam_epsilon,
-        )
+            return AdamW(
+                [
+                    {"params": encoder_params, "lr": self.config.encoder_lr, "weight_decay": self.config.weight_decay},
+                    {"params": task_params, "lr": self.config.task_lr, "weight_decay": self.config.weight_decay},
+                ],
+                betas=(self.config.adam_beta1, self.config.adam_beta2),
+                eps=self.config.adam_epsilon,
+            )
 
     def _create_dataloader(self, dataset: ExtractorDataset, batch_size: int, shuffle: bool = True, is_training: bool = True) -> DataLoader:
         sampler = None
@@ -610,18 +815,26 @@ class GLiNER2Trainer:
             shuffle = False
 
         collator = ExtractorCollator(self.processor, is_training=is_training)
+        
+        # Fix Bug #1 & #9: Handle small datasets
+        # If dataset is smaller than batch_size, adjust to prevent empty dataloader
+        effective_batch_size = min(batch_size, len(dataset))
+        drop_last = is_training and len(dataset) > batch_size
+        
+        # Adjust num_workers for small datasets
+        effective_num_workers = self.config.num_workers if len(dataset) > self.config.num_workers else 0
 
         return DataLoader(
             dataset,
-            batch_size=batch_size,
+            batch_size=effective_batch_size,
             shuffle=shuffle,
             sampler=sampler,
-            num_workers=self.config.num_workers,
+            num_workers=effective_num_workers,
             pin_memory=self.config.pin_memory,
-            prefetch_factor=self.config.prefetch_factor if self.config.num_workers > 0 else None,
+            prefetch_factor=self.config.prefetch_factor if effective_num_workers > 0 else None,
             collate_fn=collator,
-            drop_last=is_training,
-            persistent_workers=self.config.num_workers > 0,
+            drop_last=drop_last,
+            persistent_workers=effective_num_workers > 0,
         )
 
     def train(
@@ -660,10 +873,30 @@ class GLiNER2Trainer:
         train_dataset = self._prepare_data(train_data, is_train=True)
         eval_dataset = self._prepare_data(eval_data, is_train=False) if eval_data else None
 
+        # Fix Bug #7: Validate training setup
+        self._validate_training_setup(train_dataset, eval_dataset)
+
         train_loader = self._create_dataloader(train_dataset, self.config.batch_size, shuffle=True, is_training=True)
+
+        # Fix Bug #1: Check if dataloader is empty
+        if len(train_loader) == 0:
+            raise ValueError(
+                f"Training dataloader is empty. Dataset size: {len(train_dataset)}, "
+                f"Batch size: {self.config.batch_size}. Please reduce batch_size or add more data."
+            )
 
         # Calculate steps
         num_update_steps_per_epoch = len(train_loader) // self.config.gradient_accumulation_steps
+        
+        # Fix Bug #1: Handle case where num_update_steps_per_epoch is 0
+        if num_update_steps_per_epoch == 0:
+            # If gradient accumulation is larger than dataloader, we have at least the batches we can process
+            num_update_steps_per_epoch = 1
+            logger.warning(
+                f"gradient_accumulation_steps ({self.config.gradient_accumulation_steps}) is larger than "
+                f"batches per epoch ({len(train_loader)}). Setting to 1 update step per epoch."
+            )
+        
         if self.config.max_steps > 0:
             max_steps = self.config.max_steps
             num_epochs = math.ceil(max_steps / num_update_steps_per_epoch)
@@ -694,6 +927,16 @@ class GLiNER2Trainer:
         logger.info(f"  Effective batch size = {self.config.effective_batch_size}")
         logger.info(f"  Total optimization steps = {max_steps}")
         logger.info(f"  Warmup steps = {warmup_steps}")
+        
+        # Log trainable parameters
+        if self.config.use_lora:
+            lora_params, total_params, percentage = count_lora_parameters(self.model)
+            logger.info(f"  LoRA enabled: {lora_params:,} trainable / {total_params:,} total ({percentage:.2f}%)")
+        else:
+            trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            total_params = sum(p.numel() for p in self.model.parameters())
+            percentage = (trainable_params / total_params * 100) if total_params > 0 else 0.0
+            logger.info(f"  Trainable parameters: {trainable_params:,} / {total_params:,} ({percentage:.2f}%)")
 
         # Training state
         self.model.train()
@@ -753,16 +996,20 @@ class GLiNER2Trainer:
 
                     if self.global_step % self.config.logging_steps == 0:
                         elapsed = time.time() - start_time
+                        # Fix Bug #2: Safe division for metrics
+                        avg_loss = self._safe_divide(tr_loss, self.config.logging_steps, default=tr_loss)
+                        # Fix Bug #5: Safe division for epoch progress
+                        epoch_progress = self._safe_divide(step, len(train_loader), default=0.0)
                         metrics = TrainingMetrics(
-                            loss=tr_loss / self.config.logging_steps,
+                            loss=avg_loss,
                             classification_loss=outputs.get("classification_loss", torch.tensor(0)).item(),
                             structure_loss=outputs.get("structure_loss", torch.tensor(0)).item(),
                             count_loss=outputs.get("count_loss", torch.tensor(0)).item(),
                             learning_rate=self.scheduler.get_last_lr()[0],
-                            epoch=epoch + step / len(train_loader),
+                            epoch=epoch + epoch_progress,
                             step=self.global_step,
                             samples_seen=samples_seen,
-                            throughput=samples_seen / elapsed,
+                            throughput=self._safe_divide(samples_seen, elapsed, default=0.0),
                         )
                         self._log_metrics(metrics, prefix="train")
                         tr_loss = 0.0
@@ -783,8 +1030,16 @@ class GLiNER2Trainer:
 
                     if self.global_step >= max_steps:
                         break
+            
+            # Fix Bug #6: Flush incomplete gradient accumulation at end of epoch
+            if epoch_steps % self.config.gradient_accumulation_steps != 0:
+                grad_norm = self._flush_gradients()
+                if grad_norm is not None:
+                    logger.info(f"Applied incomplete gradient accumulation at end of epoch {epoch + 1}")
 
-            logger.info(f"Epoch {epoch + 1}/{num_epochs} - Loss: {epoch_loss / epoch_steps:.4f}")
+            # Fix Bug #3: Safe division for epoch loss
+            avg_epoch_loss = self._safe_divide(epoch_loss, epoch_steps, default=0.0)
+            logger.info(f"Epoch {epoch + 1}/{num_epochs} - Loss: {avg_epoch_loss:.4f}")
 
             if self.config.eval_strategy == "epoch" and eval_dataset:
                 eval_metrics = self._evaluate(eval_dataset)
@@ -829,6 +1084,21 @@ class GLiNER2Trainer:
 
         eval_loader = self._create_dataloader(eval_dataset, self.config.eval_batch_size, shuffle=False, is_training=False)
 
+        # Fix Bug #4: Check if eval dataloader is empty
+        if len(eval_loader) == 0:
+            logger.warning(
+                f"Evaluation dataloader is empty. Dataset size: {len(eval_dataset)}, "
+                f"Batch size: {self.config.eval_batch_size}. Skipping evaluation."
+            )
+            return {
+                "eval_loss": 0.0,
+                "eval_classification_loss": 0.0,
+                "eval_structure_loss": 0.0,
+                "eval_count_loss": 0.0,
+                "step": self.global_step,
+                "epoch": self.epoch,
+            }
+
         total_loss = 0.0
         total_cls_loss = 0.0
         total_struct_loss = 0.0
@@ -843,17 +1113,19 @@ class GLiNER2Trainer:
                 with autocast(enabled=use_amp, dtype=amp_dtype):
                     outputs = self.model(batch)
 
-                total_loss += outputs["total_loss"].item()
-                total_cls_loss += outputs.get("classification_loss", torch.tensor(0)).item()
-                total_struct_loss += outputs.get("structure_loss", torch.tensor(0)).item()
-                total_count_loss += outputs.get("count_loss", torch.tensor(0)).item()
+                # Fix Bug #10: Move tensors to CPU to prevent memory leak
+                total_loss += outputs["total_loss"].detach().cpu().item()
+                total_cls_loss += outputs.get("classification_loss", torch.tensor(0)).detach().cpu().item()
+                total_struct_loss += outputs.get("structure_loss", torch.tensor(0)).detach().cpu().item()
+                total_count_loss += outputs.get("count_loss", torch.tensor(0)).detach().cpu().item()
                 num_batches += 1
 
+        # Fix Bug #4: Safe division for evaluation metrics
         metrics = {
-            "eval_loss": total_loss / num_batches,
-            "eval_classification_loss": total_cls_loss / num_batches,
-            "eval_structure_loss": total_struct_loss / num_batches,
-            "eval_count_loss": total_count_loss / num_batches,
+            "eval_loss": self._safe_divide(total_loss, num_batches, default=0.0),
+            "eval_classification_loss": self._safe_divide(total_cls_loss, num_batches, default=0.0),
+            "eval_structure_loss": self._safe_divide(total_struct_loss, num_batches, default=0.0),
+            "eval_count_loss": self._safe_divide(total_count_loss, num_batches, default=0.0),
             "step": self.global_step,
             "epoch": self.epoch,
         }
@@ -893,26 +1165,53 @@ class GLiNER2Trainer:
         return self.patience_counter >= self.config.early_stopping_patience
 
     def _log_metrics(self, metrics: Union[Dict, TrainingMetrics], prefix: str = ""):
+        """Log metrics with safe handling of edge cases."""
         if isinstance(metrics, TrainingMetrics):
             metrics = metrics.to_dict()
+        
+        # Handle empty metrics gracefully
+        if not metrics:
+            logger.warning("Attempted to log empty metrics")
+            return
 
         if self.is_main_process:
             log_str = f"[Step {self.global_step}]"
             for key, value in metrics.items():
                 if isinstance(value, float):
-                    log_str += f" {prefix}_{key}: {value:.4f}"
+                    # Handle NaN and Inf values
+                    if math.isnan(value):
+                        log_str += f" {prefix}_{key}: NaN"
+                    elif math.isinf(value):
+                        log_str += f" {prefix}_{key}: Inf"
+                    else:
+                        log_str += f" {prefix}_{key}: {value:.4f}"
+                elif isinstance(value, int):
+                    log_str += f" {prefix}_{key}: {value}"
             logger.info(log_str)
 
         if self.tb_writer:
             for key, value in metrics.items():
                 if isinstance(value, (int, float)):
-                    self.tb_writer.add_scalar(f"{prefix}/{key}", value, self.global_step)
+                    # Skip NaN and Inf values for TensorBoard
+                    if not (math.isnan(value) or math.isinf(value)):
+                        try:
+                            self.tb_writer.add_scalar(f"{prefix}/{key}", value, self.global_step)
+                        except Exception as e:
+                            logger.warning(f"Failed to log {key} to TensorBoard: {e}")
 
         if self.wandb_run:
-            import wandb
-            wandb_metrics = {f"{prefix}/{k}": v for k, v in metrics.items() if isinstance(v, (int, float))}
-            if wandb_metrics:
-                wandb.log(wandb_metrics, step=self.global_step)
+            try:
+                import wandb
+                # Filter out NaN and Inf values for wandb
+                wandb_metrics = {
+                    f"{prefix}/{k}": v 
+                    for k, v in metrics.items() 
+                    if isinstance(v, (int, float)) and not (math.isnan(v) or math.isinf(v))
+                }
+                if wandb_metrics:
+                    wandb.log(wandb_metrics, step=self.global_step)
+            except Exception as e:
+                logger.warning(f"Failed to log to wandb: {e}")
 
         if prefix == "train":
             self.train_metrics_history.append(metrics)
@@ -923,20 +1222,61 @@ class GLiNER2Trainer:
 
         checkpoint_dir = self.checkpoints_dir / name
         checkpoint_dir.mkdir(exist_ok=True)
+        
+        # If using LoRA, merge weights before saving
+        # Checkpoints always contain merged weights (as specified)
+        lora_was_merged = False
+        if self.config.use_lora and self.lora_layers:
+            # Check if already merged to avoid redundant merging
+            first_lora_layer = next(iter(self.lora_layers.values()))
+            if not first_lora_layer.merged:
+                logger.info(f"Merging LoRA weights before saving checkpoint: {name}")
+                num_merged = merge_lora_weights(self.model)
+                logger.info(f"Merged {num_merged} LoRA layers into base model")
+                lora_was_merged = True
+            else:
+                logger.debug("LoRA weights already merged, skipping merge")
+        
+        # Save the model (with merged weights if LoRA was used)
         self.model.save_pretrained(str(checkpoint_dir))
+        
+        # Unmerge weights after saving to continue training with LoRA
+        if lora_was_merged:
+            from gliner2.training.lora import unmerge_lora_weights
+            logger.debug("Unmerging LoRA weights to continue training")
+            unmerge_lora_weights(self.model)
+        
+        # Save LoRA configuration if used
+        if self.config.use_lora:
+            lora_config_dict = {
+                "use_lora": True,
+                "lora_r": self.config.lora_r,
+                "lora_alpha": self.config.lora_alpha,
+                "lora_dropout": self.config.lora_dropout,
+                "lora_target_modules": self.config.lora_target_modules,
+                "merged": True,  # Weights are always merged in checkpoints
+            }
+            import json
+            with open(checkpoint_dir / "lora_config.json", "w") as f:
+                json.dump(lora_config_dict, f, indent=2)
+            logger.info("Saved LoRA configuration to lora_config.json")
 
-        state = {
-            "global_step": self.global_step,
-            "epoch": self.epoch,
-            "best_metric": self.best_metric,
-            "optimizer_state": self.optimizer.state_dict(),
-            "scheduler_state": self.scheduler.state_dict(),
-        }
-        if self.scaler:
-            state["scaler_state"] = self.scaler.state_dict()
+        # Save training state (optimizer, scheduler, etc.) if enabled
+        if self.config.save_optimizer_state:
+            state = {
+                "global_step": self.global_step,
+                "epoch": self.epoch,
+                "best_metric": self.best_metric,
+                "optimizer_state": self.optimizer.state_dict(),
+                "scheduler_state": self.scheduler.state_dict(),
+            }
+            if self.scaler:
+                state["scaler_state"] = self.scaler.state_dict()
 
-        torch.save(state, checkpoint_dir / "training_state.pt")
-        logger.info(f"Saved checkpoint: {name}")
+            torch.save(state, checkpoint_dir / "training_state.pt")
+            logger.info(f"Saved checkpoint: {name} (with training state)")
+        else:
+            logger.info(f"Saved checkpoint: {name} (model only, no training state)")
 
         if self.wandb_run and name in ["best", "final"]:
             try:
@@ -966,24 +1306,61 @@ class GLiNER2Trainer:
             logger.info(f"Removed old checkpoint: {oldest.name}")
 
     def resume_from_checkpoint(self, checkpoint_path: str):
+        """
+        Resume training from a checkpoint.
+        
+        Note: Checkpoints contain merged weights. If you want to continue training
+        with LoRA, ensure use_lora=True in your TrainingConfig. LoRA will be
+        re-applied to the loaded model.
+        """
         checkpoint_dir = Path(checkpoint_path)
+        
+        # Check if checkpoint was saved with LoRA
+        lora_config_path = checkpoint_dir / "lora_config.json"
+        if lora_config_path.exists():
+            import json
+            with open(lora_config_path) as f:
+                lora_config = json.load(f)
+            logger.info(
+                f"Checkpoint was trained with LoRA (r={lora_config.get('lora_r')}, "
+                f"alpha={lora_config.get('lora_alpha')}). Weights are merged."
+            )
+            if self.config.use_lora:
+                logger.info(
+                    "LoRA is enabled in current config. LoRA layers will be re-applied "
+                    "on top of the loaded merged weights."
+                )
+        
+        # Load model (with merged weights if it was trained with LoRA)
         self.model = self.model.__class__.from_pretrained(str(checkpoint_dir))
         self.model.to(self.device)
+        
+        # Re-apply LoRA if enabled in current config
+        # This creates new LoRA layers initialized from scratch
+        if self.config.use_lora:
+            logger.info("Re-applying LoRA to resumed model...")
+            self.lora_layers = {}
+            self._setup_lora()
 
         state_path = checkpoint_dir / "training_state.pt"
         if state_path.exists():
             state = torch.load(state_path, map_location=self.device)
-            self.global_step = state["global_step"]
-            self.epoch = state["epoch"]
-            self.best_metric = state["best_metric"]
+            self.global_step = state.get("global_step", 0)
+            self.epoch = state.get("epoch", 0)
+            self.best_metric = state.get("best_metric", float('inf') if not self.config.greater_is_better else float('-inf'))
             if self.optimizer and "optimizer_state" in state:
                 self.optimizer.load_state_dict(state["optimizer_state"])
             if self.scheduler and "scheduler_state" in state:
                 self.scheduler.load_state_dict(state["scheduler_state"])
             if self.scaler and "scaler_state" in state:
                 self.scaler.load_state_dict(state["scaler_state"])
-
-        logger.info(f"Resumed from checkpoint: {checkpoint_path} (step {self.global_step})")
+            logger.info(f"Resumed from checkpoint: {checkpoint_path} (step {self.global_step})")
+        else:
+            logger.warning(
+                f"Training state not found at {state_path}. "
+                "Starting from step 0. This is normal if checkpoint was saved with save_optimizer_state=False."
+            )
+            logger.info(f"Loaded model from checkpoint: {checkpoint_path}")
 
 
 # =============================================================================
