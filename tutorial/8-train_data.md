@@ -1,13 +1,22 @@
 # GLiNER2 Training Dataset Formats
 
-GLiNER2 uses JSONL format where each line contains an `input` and `output` field. The `input` is the text, and the `output` is the schema with labels/annotations.
+GLiNER2 uses JSONL format where each line contains an `input` and `output` field (or alternatively `text` and `schema`). The `input`/`text` is the text to process, and the `output`/`schema` is the schema with labels/annotations.
 
 ## Quick Format Reference
 
 ### General Structure
+
+**Primary Format**:
 ```jsonl
 {"input": "text to process", "output": {"schema_definition": "with_annotations"}}
 ```
+
+**Alternative Format** (also supported):
+```jsonl
+{"text": "text to process", "schema": {"schema_definition": "with_annotations"}}
+```
+
+Both formats are equivalent - use whichever is more convenient for your workflow.
 
 ### Valid Output Schema Keys
 
@@ -29,7 +38,7 @@ GLiNER2 uses JSONL format where each line contains an `input` and `output` field
 | `true_label` | `list[str]` or `str` | Yes | Correct label(s) |
 | `multi_label` | `bool` | No | Enable multi-label classification |
 | `prompt` | `str` | No | Custom prompt for the task |
-| `examples` | `list[list[str]]` | No | Few-shot examples as [[input, output], ...] pairs |
+| `examples` | `list[list[str]]` or `list[tuple[str, str]]` | No | Few-shot examples as [[input, output], ...] pairs. Internally converted to list of lists. |
 | `label_descriptions` | `dict[str, str]` | No | Label → description mapping |
 
 ### Entity Fields Format
@@ -77,8 +86,23 @@ Relations use flexible field structures - you can use ANY field names (not just 
 - The first instance of "works_for" determines what fields ALL "works_for" instances must have
 - All subsequent instances of the same relation type must use the same field names
 - Different relation types can have different field structures
+- **This consistency is enforced during validation** - inconsistent field structures will raise a `ValidationError`
 
 **Example**: If first "works_for" has `{"head": "...", "tail": "..."}`, all other "works_for" instances must also have "head" and "tail" fields.
+
+**Validation**: The `TrainingDataset.validate_relation_consistency()` method checks that all relation types have consistent field structures across the entire dataset.
+
+---
+
+## Alternative Input Formats
+
+The training data loader supports multiple input formats:
+
+1. **JSONL files**: `{"input": "...", "output": {...}}` or `{"text": "...", "schema": {...}}`
+2. **Python API**: Use `InputExample` and `TrainingDataset` classes from `gliner2.training.data`
+3. **Dict lists**: List of dictionaries in the same format as JSONL
+
+All formats are automatically detected and converted to the internal format. See `gliner2.training.data.DataLoader_Factory` for details.
 
 ---
 
@@ -113,9 +137,15 @@ Relations use flexible field structures - you can use ANY field names (not just 
 
 ### Classification with Few-Shot Examples
 
+Few-shot examples are provided as a list of `[input, output]` pairs. Each example is a list/tuple with exactly 2 elements:
+
 ```jsonl
 {"input": "This service exceeded all my expectations!", "output": {"classifications": [{"task": "sentiment", "labels": ["positive", "negative", "neutral"], "true_label": ["positive"], "examples": [["Great product, highly recommend!", "positive"], ["Terrible experience, very disappointed.", "negative"], ["It's okay, nothing special.", "neutral"]]}]}}
 ```
+
+**Format**: `"examples": [[input_text, output_label], [input_text, output_label], ...]`
+
+Each example pair must have exactly 2 elements: the input text and the corresponding label.
 
 ### Classification with Both Examples and Descriptions
 
@@ -139,7 +169,10 @@ Both formats are supported - use list for consistency or string for brevity:
 {"input": "This is great!", "output": {"classifications": [{"task": "sentiment", "labels": ["positive", "negative", "neutral"], "true_label": "positive"}]}}
 ```
 
-**Note**: String format (`"true_label": "positive"`) and list format (`"true_label": ["positive"]`) are both valid for single-label classification.
+**Note**: 
+- String format (`"true_label": "positive"`) and list format (`"true_label": ["positive"]`) are both valid for single-label classification
+- Internally, string values are automatically converted to lists (`["positive"]`)
+- For multi-label classification, always use list format: `"true_label": ["label1", "label2"]`
 
 ---
 
@@ -404,9 +437,13 @@ You can use custom field names - the first occurrence defines what fields to use
 
 ### Partial Multi-Task (Some Tasks Empty)
 
+**Note**: While you can include empty dictionaries/lists for some tasks, at least one task must have content.
+
 ```jsonl
 {"input": "The weather forecast predicts rain tomorrow.", "output": {"entities": {}, "classifications": [{"task": "weather", "labels": ["sunny", "rainy", "cloudy", "snowy"], "true_label": ["rainy"]}], "json_structures": []}}
 ```
+
+This is valid because it has a classification task. However, if all tasks were empty, it would fail validation.
 
 ---
 
@@ -414,20 +451,28 @@ You can use custom field names - the first occurrence defines what fields to use
 
 ### Completely Empty Output
 
+**⚠️ Note**: Examples must have at least one task (entities, classifications, structures, or relations). Completely empty outputs are not valid training examples.
+
 ```jsonl
 {"input": "Random text with no specific information.", "output": {"entities": {}, "classifications": [], "json_structures": [], "relations": []}}
 ```
 
+This format will fail validation. Each example must contain at least one annotation.
+
 ### Empty Entities Dictionary
 
+**⚠️ Note**: While an empty entities dictionary is syntactically valid, examples must have at least one task. If you only have empty entities, add at least one other task (classification, structure, or relation).
+
 ```jsonl
-{"input": "The weather is nice today.", "output": {"entities": {}}}
+{"input": "The weather is nice today.", "output": {"entities": {}, "classifications": [{"task": "sentiment", "labels": ["positive", "negative"], "true_label": ["positive"]}]}}
 ```
 
 ### Empty Classifications List
 
+**⚠️ Note**: While an empty classifications list is syntactically valid, examples must have at least one task. If you only have empty classifications, add at least one other task.
+
 ```jsonl
-{"input": "Some generic text.", "output": {"classifications": []}}
+{"input": "Some generic text.", "output": {"classifications": [], "entities": {"location": ["text"]}}}
 ```
 
 ### Very Long Label Lists
@@ -546,26 +591,40 @@ You can use custom field names - the first occurrence defines what fields to use
 ## Tips for Dataset Creation
 
 1. **Use diverse examples** to improve model generalization
-2. **Include edge cases** and negative examples (empty outputs)
+2. **Include edge cases** - but remember each example must have at least one task
 3. **Provide descriptions** when possible to improve accuracy
 4. **Balance your classes** in classification tasks
 5. **Use realistic text** that matches your target domain
 6. **Include multiple instances** for JSON structures when applicable
-7. **Test with empty results** to handle cases where no entities/structures are found
+7. **For negative examples**, include at least one task (e.g., empty entities but a classification, or empty classifications but entities)
 8. **Mix task types** to train multi-task capabilities
 9. **Use consistent formatting** for similar examples
 10. **Include special characters** to ensure robust handling
+11. **Validate your dataset** using `TrainingDataset.validate(strict=True)` to catch annotation errors early
+12. **Check relation consistency** using `validate_relation_consistency()` to ensure all relation types have consistent field structures
 
 ## Validation Checklist
 
 Make sure your JSONL file is valid by checking:
 - [ ] Each line is valid JSON
-- [ ] Required fields (`input`, `output`) are present
+- [ ] Required fields (`input`/`output` or `text`/`schema`) are present
+- [ ] **At least one task is present** (entities, classifications, structures, or relations)
 - [ ] Schema structure matches the expected format
-- [ ] Entity spans exist in the input text (entities can be found in the input)
+- [ ] Entity spans exist in the input text (entities can be found in the input) - checked in strict validation mode
 - [ ] Classification labels are from the defined label set
-- [ ] `true_label` is always a list for consistency (or allowed as string)
-- [ ] JSON structure fields match between instances of the same parent
+- [ ] `true_label` is a list or string (string format is converted to list internally)
+- [ ] For multi-label classification, `multi_label` is set to `true` when multiple labels are provided
+- [ ] JSON structure fields match between instances of the same parent (flexible - union of fields is used)
+- [ ] **Relation field consistency**: All instances of the same relation type use the same field names (determined by first occurrence)
 - [ ] No trailing commas in JSON objects
 - [ ] Special characters are properly escaped
 - [ ] File encoding is UTF-8
+
+### Validation Modes
+
+The implementation supports two validation modes:
+
+- **Standard validation**: Checks format correctness, required fields, label consistency
+- **Strict validation**: Additionally checks that entity mentions and relation values exist in the input text (case-insensitive substring matching)
+
+Use strict validation during dataset creation to catch annotation errors early.
