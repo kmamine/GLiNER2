@@ -151,8 +151,6 @@ class TrainingConfig:
         Random seed.
     validate_data : bool
         Validate training data before training.
-    strict_validation : bool
-        Check entity spans exist in text.
     """
     output_dir: str = "./output"
     experiment_name: str = "gliner2"
@@ -205,8 +203,7 @@ class TrainingConfig:
     max_train_samples: int = -1
     max_eval_samples: int = -1
     validate_data: bool = True
-    strict_validation: bool = False
-    
+
     # LoRA Configuration (Parameter-Efficient Fine-Tuning)
     use_lora: bool = False
     lora_r: int = 8
@@ -736,8 +733,7 @@ class GLiNER2Trainer:
             max_samples=max_samples,
             shuffle=is_train,
             seed=self.config.seed,
-            validate=self.config.validate_data if is_train else False,
-            strict_validation=self.config.strict_validation,
+            validate=self.config.validate_data if is_train else False
         )
 
     def _create_optimizer(self) -> AdamW:
