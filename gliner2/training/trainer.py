@@ -619,11 +619,10 @@ class GLiNER2Trainer:
             target_modules=self.config.lora_target_modules,
         )
         
-        # Apply LoRA to encoder only
+        # Apply LoRA (encoder: targeted modules, non-encoder: all linear layers)
         self.model, self.lora_layers = apply_lora_to_model(
             model=self.model,
             config=lora_config,
-            encoder_only=True,
         )
         
         # Print LoRA information
@@ -744,12 +743,15 @@ class GLiNER2Trainer:
             lora_params = get_lora_parameters(self.model)
             task_params = []
             
-            # Get task-specific parameters (not in encoder)
+            # Get task-specific parameters (not in encoder, not LoRA)
             for name, param in self.model.named_parameters():
                 if not param.requires_grad:
                     continue
                 # Skip encoder parameters (they're frozen except LoRA)
                 if "encoder" in name:
+                    continue
+                # Skip LoRA parameters (already collected above)
+                if "lora_A" in name or "lora_B" in name:
                     continue
                 task_params.append(param)
             

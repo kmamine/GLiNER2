@@ -132,6 +132,27 @@ class LoRALayer(nn.Module):
         # Flag to track if weights are merged
         self.merged = False
     
+    # Expose base layer attributes for compatibility
+    @property
+    def weight(self):
+        """Expose weight from base layer for compatibility."""
+        return self.base_layer.weight
+    
+    @property
+    def bias(self):
+        """Expose bias from base layer for compatibility."""
+        return self.base_layer.bias
+    
+    @property
+    def in_features(self):
+        """Expose in_features from base layer."""
+        return self.base_layer.in_features
+    
+    @property
+    def out_features(self):
+        """Expose out_features from base layer."""
+        return self.base_layer.out_features
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass with LoRA.
@@ -199,19 +220,19 @@ class LoRALayer(nn.Module):
 def apply_lora_to_model(
     model: nn.Module,
     config: LoRAConfig,
-    encoder_only: bool = True,
 ) -> Tuple[nn.Module, Dict[str, LoRALayer]]:
     """
-    Apply LoRA to target modules in the model's encoder.
+    Apply LoRA to model with different rules for encoder vs non-encoder layers.
+    
+    For encoder: Only apply LoRA to target modules specified in config.target_modules.
+    For non-encoder layers: Apply LoRA to ALL linear layers.
     
     Parameters
     ----------
     model : nn.Module
-        The model (should have .encoder attribute for GLiNER2).
+        The model to apply LoRA to (should have .encoder attribute for GLiNER2).
     config : LoRAConfig
         LoRA configuration.
-    encoder_only : bool
-        If True, only apply LoRA to model.encoder (default and recommended).
     
     Returns
     -------
@@ -224,29 +245,35 @@ def apply_lora_to_model(
         logger.info("LoRA is disabled, skipping application")
         return model, {}
     
-    # Get the encoder module
-    if encoder_only:
-        if not hasattr(model, 'encoder'):
-            raise ValueError("Model does not have 'encoder' attribute. Cannot apply LoRA.")
-        root_module = model.encoder
-        root_name = "encoder"
-    else:
-        root_module = model
-        root_name = "model"
-    
     lora_layers = {}
+    encoder_lora_count = 0
+    non_encoder_lora_count = 0
     
-    def _should_apply_lora(module_name: str) -> bool:
-        """Check if LoRA should be applied to this module using substring matching."""
+    def _should_apply_lora_to_encoder_module(module_name: str) -> bool:
+        """Check if LoRA should be applied to this encoder module using substring matching."""
         return any(target in module_name for target in config.target_modules)
     
-    # Recursively find and replace target modules
-    def _inject_lora_recursive(module: nn.Module, prefix: str = ""):
+    # Recursively find and replace modules
+    def _inject_lora_recursive(module: nn.Module, prefix: str = "", in_encoder: bool = False):
+        nonlocal encoder_lora_count, non_encoder_lora_count
+        
         for name, child in module.named_children():
             full_name = f"{prefix}.{name}" if prefix else name
             
-            # Check if this is a target module (must be Linear layer)
-            if isinstance(child, nn.Linear) and _should_apply_lora(name):
+            # Check if we're entering the encoder
+            is_encoder_module = (name == "encoder" and not prefix) or in_encoder
+            
+            # Determine if we should apply LoRA to this Linear layer
+            should_apply = False
+            if isinstance(child, nn.Linear):
+                if is_encoder_module:
+                    # In encoder: only apply to target modules
+                    should_apply = _should_apply_lora_to_encoder_module(name)
+                else:
+                    # Outside encoder: apply to all Linear layers
+                    should_apply = True
+            
+            if should_apply:
                 # Replace with LoRA layer
                 lora_layer = LoRALayer(
                     base_layer=child,
@@ -255,21 +282,31 @@ def apply_lora_to_model(
                     dropout=config.dropout,
                 )
                 setattr(module, name, lora_layer)
-                lora_layers[f"{root_name}.{full_name}"] = lora_layer
-                logger.debug(f"Applied LoRA to {root_name}.{full_name} (in={child.in_features}, out={child.out_features})")
+                lora_layers[f"model.{full_name}"] = lora_layer
+                
+                if is_encoder_module:
+                    encoder_lora_count += 1
+                else:
+                    non_encoder_lora_count += 1
+                
+                logger.debug(f"Applied LoRA to model.{full_name} (in={child.in_features}, out={child.out_features}, encoder={is_encoder_module})")
             else:
                 # Recurse into child
-                _inject_lora_recursive(child, full_name)
+                _inject_lora_recursive(child, full_name, is_encoder_module)
     
-    _inject_lora_recursive(root_module)
+    _inject_lora_recursive(model)
     
     if not lora_layers:
         logger.warning(
-            f"No LoRA layers were applied. Target modules {config.target_modules} "
-            f"not found in {root_name}. Check your target_modules configuration."
+            f"No LoRA layers were applied. For encoder, target modules {config.target_modules} "
+            f"not found. Check your target_modules configuration."
         )
     else:
-        logger.info(f"Applied LoRA to {len(lora_layers)} layers in {root_name}")
+        logger.info(
+            f"Applied LoRA to {len(lora_layers)} layers total: "
+            f"{encoder_lora_count} in encoder (targeted), "
+            f"{non_encoder_lora_count} in non-encoder (all linear)"
+        )
     
     return model, lora_layers
 
