@@ -52,13 +52,19 @@ class LoRAConfig:
         Module names to apply LoRA to. Supported module groups:
         
         - "encoder" - Applies LoRA to query, key, value, dense layers within encoder
+        - "encoder.query" - Only query layers in encoder
+        - "encoder.key" - Only key layers in encoder
+        - "encoder.value" - Only value layers in encoder
+        - "encoder.dense" - Only dense layers in encoder
         - "span_rep" - Applies LoRA to ALL linear layers within span_rep
         - "classifier" - Applies LoRA to ALL linear layers within classifier
         - "count_embed" - Applies LoRA to ALL linear layers within count_embed
         - "count_pred" - Applies LoRA to ALL linear layers within count_pred
         
         Examples:
-        - ["encoder"] - encoder only (default)
+        - ["encoder"] - all encoder layers (query, key, value, dense)
+        - ["encoder.query", "encoder.key", "encoder.value"] - only attention layers
+        - ["encoder.dense"] - only dense (FFN) layers in encoder
         - ["encoder", "span_rep", "classifier"] - encoder + task heads
         - ["classifier"] - classifier fine-tuning only
     """
@@ -301,6 +307,10 @@ def apply_lora_to_model(
     
     Module group behavior:
     - "encoder": Applies LoRA to query, key, value, dense layers within encoder
+    - "encoder.query": Only query layers in encoder
+    - "encoder.key": Only key layers in encoder
+    - "encoder.value": Only value layers in encoder
+    - "encoder.dense": Only dense layers in encoder
     - "span_rep", "classifier", "count_embed", "count_pred": Applies LoRA to ALL linear layers
     
     Parameters
@@ -341,6 +351,11 @@ def apply_lora_to_model(
                     # Check if local name matches encoder patterns
                     if any(pattern in local_name for pattern in ENCODER_PATTERNS):
                         return True
+            elif target.startswith("encoder."):
+                # Specific encoder layer (e.g., "encoder.query", "encoder.dense")
+                layer_name = target.split(".", 1)[1]  # Extract "query" from "encoder.query"
+                if full_path.startswith("encoder.") and layer_name in local_name:
+                    return True
             elif target in ALL_LINEAR_MODULES:
                 # For these modules, apply to ALL linear layers within
                 if full_path.startswith(f"{target}."):

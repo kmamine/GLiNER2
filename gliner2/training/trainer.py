@@ -131,9 +131,11 @@ class TrainingConfig:
     greater_is_better : bool
         Whether higher metric is better.
     logging_steps : int
-        Log every N steps.
-    report_to : List[str]
-        Logging backends: "tensorboard", "wandb".
+        Log every N steps (updates progress bar metrics).
+    report_to_wandb : bool
+        Enable Weights & Biases logging.
+    wandb_project : str, optional
+        W&B project name.
     early_stopping : bool
         Enable early stopping.
     early_stopping_patience : int
@@ -144,6 +146,29 @@ class TrainingConfig:
         Random seed.
     validate_data : bool
         Validate training data before training.
+    use_lora : bool
+        Enable LoRA (Low-Rank Adaptation) for parameter-efficient fine-tuning.
+    lora_r : int
+        LoRA rank (bottleneck dimension). Higher = more parameters but better approximation.
+        Typical values: 4, 8, 16, 32, 64.
+    lora_alpha : float
+        LoRA scaling factor. Final scaling is alpha/r. Typical: 2*r.
+    lora_dropout : float
+        Dropout probability for LoRA layers.
+    lora_target_modules : List[str]
+        Module groups to apply LoRA to. Options:
+        - "encoder": All encoder layers (query, key, value, dense)
+        - "encoder.query": Only query layers in encoder
+        - "encoder.key": Only key layers in encoder
+        - "encoder.value": Only value layers in encoder
+        - "encoder.dense": Only dense (FFN) layers in encoder
+        - "span_rep": All linear layers in span representation
+        - "classifier": All linear layers in classifier head
+        - "count_embed": All linear layers in count embedding
+        - "count_pred": All linear layers in count prediction
+        Default: All modules for maximum adaptation.
+    save_adapter_only : bool
+        When use_lora=True, save only adapter weights (not full model).
     """
     output_dir: str = "./output"
     experiment_name: str = "gliner2"
@@ -196,10 +221,10 @@ class TrainingConfig:
 
     # LoRA Configuration (Parameter-Efficient Fine-Tuning)
     use_lora: bool = False
-    lora_r: int = 8
-    lora_alpha: float = 16.0
+    lora_r: int = 16
+    lora_alpha: float = 32.0
     lora_dropout: float = 0.0
-    lora_target_modules: List[str] = field(default_factory=lambda: ["query", "key", "value"])
+    lora_target_modules: List[str] = field(default_factory=lambda: ["encoder", "span_rep", "classifier", "count_embed", "count_pred"])
     save_adapter_only: bool = True  # Only applies when use_lora=True
 
     def __post_init__(self):
