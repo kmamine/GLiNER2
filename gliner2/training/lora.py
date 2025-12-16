@@ -49,18 +49,24 @@ class LoRAConfig:
     dropout : float
         Dropout probability applied to LoRA path.
     target_modules : List[str]
-        Names of modules to apply LoRA to. Uses substring matching.
+        Module names to apply LoRA to. Supported module groups:
+        
+        - "encoder" - Applies LoRA to query, key, value, dense layers within encoder
+        - "span_rep" - Applies LoRA to ALL linear layers within span_rep
+        - "classifier" - Applies LoRA to ALL linear layers within classifier
+        - "count_embed" - Applies LoRA to ALL linear layers within count_embed
+        - "count_pred" - Applies LoRA to ALL linear layers within count_pred
+        
         Examples:
-        - ["query", "key", "value"] - matches query_proj, key_proj, value_proj
-        - ["query_proj", "key_proj", "value_proj"] - exact match also works
-        - ["dense"] - matches all layers named 'dense'
-        Applied to encoder only.
+        - ["encoder"] - encoder only (default)
+        - ["encoder", "span_rep", "classifier"] - encoder + task heads
+        - ["classifier"] - classifier fine-tuning only
     """
     enabled: bool = False
     r: int = 8
     alpha: float = 16.0
     dropout: float = 0.0
-    target_modules: List[str] = field(default_factory=lambda: ["query", "key", "value"])
+    target_modules: List[str] = field(default_factory=lambda: ["encoder"])
     
     def __post_init__(self):
         if self.r <= 0:
@@ -282,15 +288,20 @@ class LoRALayer(nn.Module):
 # LoRA Application Functions
 # =============================================================================
 
+# Module-specific patterns for LoRA application
+ENCODER_PATTERNS = ["query", "key", "value", "dense"]
+ALL_LINEAR_MODULES = ["span_rep", "classifier", "count_embed", "count_pred"]
+
 def apply_lora_to_model(
     model: nn.Module,
     config: LoRAConfig,
 ) -> Tuple[nn.Module, Dict[str, LoRALayer]]:
     """
-    Apply LoRA to ALL linear layers matching target_modules.
+    Apply LoRA to linear layers based on module groups in target_modules.
     
-    No special handling for encoder vs non-encoder.
-    target_modules uses substring matching across entire model.
+    Module group behavior:
+    - "encoder": Applies LoRA to query, key, value, dense layers within encoder
+    - "span_rep", "classifier", "count_embed", "count_pred": Applies LoRA to ALL linear layers
     
     Parameters
     ----------
@@ -312,9 +323,29 @@ def apply_lora_to_model(
     
     lora_layers = {}
     
-    def _should_apply_lora(module_name: str) -> bool:
-        """Check if LoRA should be applied using substring matching."""
-        return any(target in module_name for target in config.target_modules)
+    def _should_apply_lora(local_name: str, full_path: str) -> bool:
+        """
+        Check if LoRA should be applied based on module groups.
+        
+        Args:
+            local_name: Local module name (e.g., "query", "linear")
+            full_path: Full path from model root (e.g., "encoder.layer.0.attention.self.query")
+        
+        Returns:
+            True if LoRA should be applied to this layer
+        """
+        for target in config.target_modules:
+            if target == "encoder":
+                # For encoder, apply only to specific patterns
+                if full_path.startswith("encoder."):
+                    # Check if local name matches encoder patterns
+                    if any(pattern in local_name for pattern in ENCODER_PATTERNS):
+                        return True
+            elif target in ALL_LINEAR_MODULES:
+                # For these modules, apply to ALL linear layers within
+                if full_path.startswith(f"{target}."):
+                    return True
+        return False
     
     # Recursively find and replace modules
     def _inject_lora_recursive(module: nn.Module, prefix: str = ""):
@@ -322,7 +353,7 @@ def apply_lora_to_model(
             full_name = f"{prefix}.{name}" if prefix else name
             
             # Apply LoRA to matching Linear layers
-            if isinstance(child, nn.Linear) and _should_apply_lora(name):
+            if isinstance(child, nn.Linear) and _should_apply_lora(name, full_name):
                 # Replace with LoRA layer
                 lora_layer = LoRALayer(
                     base_layer=child,
@@ -602,13 +633,16 @@ def save_lora_adapter(
     logger.info(f"Saved {len(lora_state)} LoRA tensors to {weights_path}")
     
     # Determine target modules from layer names
+    # Extract top-level module names (encoder, span_rep, classifier, etc.)
     target_modules = set()
     for key in lora_state.keys():
-        # Extract module name from full path (e.g., "encoder.layer.0.attention.self.query")
+        # Extract first level module from full path
+        # e.g., "encoder.layer.0.attention.self.query.lora_A" -> "encoder"
+        # e.g., "span_rep.project_start.0.lora_A" -> "span_rep"
         parts = key.split(".")
         if len(parts) > 0:
-            # Get the last meaningful name before .lora_A or .lora_B
-            module_name = parts[-2] if len(parts) >= 2 else parts[-1]
+            # Get the first level module name
+            module_name = parts[0]
             target_modules.add(module_name)
     
     # Create and save adapter config
@@ -751,13 +785,13 @@ def get_adapter_config(model: nn.Module) -> Optional[LoRAAdapterConfig]:
     for module in model.modules():
         if isinstance(module, LoRALayer):
             target_modules = set()
-            # Collect all target module names
+            # Collect all target module groups (top-level modules)
             for name, m in model.named_modules():
                 if isinstance(m, LoRALayer):
-                    # Extract module name
+                    # Extract first level module name
                     parts = name.split(".")
                     if parts:
-                        target_modules.add(parts[-1])
+                        target_modules.add(parts[0])
             
             return LoRAAdapterConfig(
                 adapter_type="lora",

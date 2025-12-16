@@ -118,25 +118,18 @@ class TrainingConfig:
         Use FP16 mixed precision.
     bf16 : bool
         Use BF16 mixed precision.
-    save_strategy : str
-        When to save: "epoch", "steps", or "no".
-    save_steps : int
-        Save every N steps (if save_strategy="steps").
+    eval_strategy : str
+        When to evaluate and save: "epoch", "steps", or "no".
+    eval_steps : int
+        Evaluate and save every N steps (if eval_strategy="steps").
     save_total_limit : int
         Maximum checkpoints to keep.
     save_best : bool
         Save best model based on metric.
-    save_optimizer_state : bool
-        Save optimizer/scheduler state for resuming training (default: True).
-        Set to False to save only model weights (smaller checkpoints).
     metric_for_best : str
         Metric to use for best model selection.
     greater_is_better : bool
         Whether higher metric is better.
-    eval_strategy : str
-        When to evaluate: "epoch", "steps", or "no".
-    eval_steps : int
-        Evaluate every N steps (if eval_strategy="steps").
     logging_steps : int
         Log every N steps.
     report_to : List[str]
@@ -156,8 +149,8 @@ class TrainingConfig:
     experiment_name: str = "gliner2"
     num_epochs: int = 10
     max_steps: int = -1
-    batch_size: int = 32
-    eval_batch_size: int = 64
+    batch_size: int = 2
+    eval_batch_size: int = 8
     gradient_accumulation_steps: int = 1
     encoder_lr: float = 1e-5
     task_lr: float = 5e-4
@@ -172,18 +165,15 @@ class TrainingConfig:
     num_cycles: float = 0.5
     fp16: bool = True
     bf16: bool = False
-    save_strategy: str = "epoch"
-    save_steps: int = 500
+    eval_strategy: str = "steps"
+    eval_steps: int = 500
     save_total_limit: int = 3
     save_best: bool = True
-    save_optimizer_state: bool = True
     metric_for_best: str = "eval_loss"
     greater_is_better: bool = False
-    eval_strategy: str = "epoch"
-    eval_steps: int = 500
-    logging_steps: int = 50
+    logging_steps: int = 1
     logging_first_step: bool = True
-    report_to: List[str] = field(default_factory=lambda: ["tensorboard"])
+    report_to_wandb: bool = False
     wandb_project: Optional[str] = None
     wandb_entity: Optional[str] = None
     wandb_run_name: Optional[str] = None
@@ -526,6 +516,7 @@ class GLiNER2Trainer:
         self.scheduler = None
         self.scaler = None
         self.wandb_run = None
+        self.progress_bar = None
         
         # LoRA state
         self.lora_layers = {}
@@ -563,11 +554,9 @@ class GLiNER2Trainer:
 
     def _setup_output_dir(self):
         self.output_dir = Path(self.config.output_dir)
-        self.checkpoints_dir = self.output_dir / "checkpoints"
         self.logs_dir = self.output_dir / "logs"
         if self.is_main_process:
             self.output_dir.mkdir(parents=True, exist_ok=True)
-            self.checkpoints_dir.mkdir(exist_ok=True)
             self.logs_dir.mkdir(exist_ok=True)
             self.config.save(str(self.output_dir / "training_config.json"))
 
@@ -577,15 +566,10 @@ class GLiNER2Trainer:
             datefmt="%Y-%m-%d %H:%M:%S",
             level=logging.INFO if self.is_main_process else logging.WARNING,
         )
-        self.tb_writer = None
-        if "tensorboard" in self.config.report_to and self.is_main_process:
-            try:
-                from torch.utils.tensorboard import SummaryWriter
-                self.tb_writer = SummaryWriter(log_dir=str(self.logs_dir))
-            except ImportError:
-                logger.warning("TensorBoard not available")
-
-        if "wandb" in self.config.report_to and self.is_main_process:
+        
+        # W&B setup (HuggingFace style)
+        self.wandb_run = None
+        if self.config.report_to_wandb and self.is_main_process:
             try:
                 import wandb
                 self.wandb_run = wandb.init(
@@ -596,12 +580,11 @@ class GLiNER2Trainer:
                     tags=self.config.wandb_tags,
                     notes=self.config.wandb_notes,
                     dir=str(self.output_dir),
-                    resume="allow",
                 )
-                wandb.watch(self.model, log="gradients", log_freq=self.config.logging_steps)
-                logger.info(f"Weights & Biases initialized: {self.wandb_run.url}")
+                logger.info(f"W&B run: {self.wandb_run.url}")
             except ImportError:
-                logger.warning("wandb not available")
+                logger.warning("wandb not installed. Run: pip install wandb")
+                self.config.report_to_wandb = False
 
     def _setup_lora(self):
         """Setup LoRA for parameter-efficient fine-tuning if enabled."""
@@ -948,7 +931,7 @@ class GLiNER2Trainer:
         start_time = time.time()
         samples_seen = 0
 
-        progress_bar = tqdm(total=max_steps, desc="Training", disable=not self.is_main_process)
+        self.progress_bar = tqdm(total=max_steps, desc="Training", disable=not self.is_main_process)
 
         for epoch in range(num_epochs):
             self.epoch = epoch
@@ -1017,16 +1000,9 @@ class GLiNER2Trainer:
                     if self.config.eval_strategy == "steps" and self.global_step % self.config.eval_steps == 0 and eval_dataset:
                         self._evaluate(eval_dataset)
                         self.model.train()
-
-                    if self.config.save_strategy == "steps" and self.global_step % self.config.save_steps == 0:
                         self._save_checkpoint(f"checkpoint-{self.global_step}")
 
-                    progress_bar.update(1)
-                    progress_bar.set_postfix({
-                        "loss": f"{loss.item() * self.config.gradient_accumulation_steps:.4f}",
-                        "lr": f"{self.scheduler.get_last_lr()[0]:.2e}",
-                        "grad": f"{grad_norm:.2f}",
-                    })
+                    self.progress_bar.update(1)
 
                     if self.global_step >= max_steps:
                         break
@@ -1044,22 +1020,19 @@ class GLiNER2Trainer:
             if self.config.eval_strategy == "epoch" and eval_dataset:
                 eval_metrics = self._evaluate(eval_dataset)
                 self.model.train()
+                self._save_checkpoint(f"checkpoint-epoch-{epoch + 1}")
                 if self.config.early_stopping and self._check_early_stopping(eval_metrics):
                     logger.info(f"Early stopping triggered at epoch {epoch + 1}")
                     break
 
-            if self.config.save_strategy == "epoch":
-                self._save_checkpoint(f"checkpoint-epoch-{epoch + 1}")
-
             if self.global_step >= max_steps:
                 break
 
-        progress_bar.close()
+        self.progress_bar.close()
+        self.progress_bar = None
 
         if self.is_main_process:
             self._save_checkpoint("final")
-            if self.tb_writer:
-                self.tb_writer.close()
             if self.wandb_run:
                 import wandb
                 wandb.summary["best_metric"] = self.best_metric
@@ -1174,37 +1147,37 @@ class GLiNER2Trainer:
             logger.warning("Attempted to log empty metrics")
             return
 
-        if self.is_main_process:
-            log_str = f"[Step {self.global_step}]"
+        # Update progress bar with key metrics
+        if self.is_main_process and self.progress_bar is not None:
+            postfix = {}
             for key, value in metrics.items():
-                if isinstance(value, float):
-                    # Handle NaN and Inf values
-                    if math.isnan(value):
-                        log_str += f" {prefix}_{key}: NaN"
-                    elif math.isinf(value):
-                        log_str += f" {prefix}_{key}: Inf"
-                    else:
-                        log_str += f" {prefix}_{key}: {value:.4f}"
-                elif isinstance(value, int):
-                    log_str += f" {prefix}_{key}: {value}"
-            logger.info(log_str)
+                if key in ["loss", "learning_rate", "throughput"]:
+                    if isinstance(value, float):
+                        if math.isnan(value):
+                            postfix[key] = "NaN"
+                        elif math.isinf(value):
+                            postfix[key] = "Inf"
+                        elif key == "learning_rate":
+                            postfix["lr"] = f"{value:.2e}"
+                        elif key == "throughput":
+                            postfix["samples/s"] = f"{value:.1f}"
+                        else:
+                            postfix[key] = f"{value:.4f}"
+            
+            # Add epoch info if available
+            if "epoch" in metrics:
+                postfix["epoch"] = f"{metrics['epoch']:.1f}"
+            
+            if postfix:
+                self.progress_bar.set_postfix(postfix)
 
-        if self.tb_writer:
-            for key, value in metrics.items():
-                if isinstance(value, (int, float)):
-                    # Skip NaN and Inf values for TensorBoard
-                    if not (math.isnan(value) or math.isinf(value)):
-                        try:
-                            self.tb_writer.add_scalar(f"{prefix}/{key}", value, self.global_step)
-                        except Exception as e:
-                            logger.warning(f"Failed to log {key} to TensorBoard: {e}")
-
+        # W&B logging (HuggingFace style)
         if self.wandb_run:
             try:
                 import wandb
                 # Filter out NaN and Inf values for wandb
                 wandb_metrics = {
-                    f"{prefix}/{k}": v 
+                    f"{prefix}_{k}": v 
                     for k, v in metrics.items() 
                     if isinstance(v, (int, float)) and not (math.isnan(v) or math.isinf(v))
                 }
@@ -1220,44 +1193,25 @@ class GLiNER2Trainer:
         if not self.is_main_process:
             return
 
-        checkpoint_dir = self.checkpoints_dir / name
+        checkpoint_dir = self.output_dir / name
         checkpoint_dir.mkdir(exist_ok=True)
+        
+        save_start = time.time()
         
         # Handle adapter-only saves when using LoRA
         if self.config.use_lora and self.config.save_adapter_only:
-            # Save adapter only (no weight merging needed)
             from gliner2.training.lora import save_lora_adapter
             save_lora_adapter(self.model, checkpoint_dir)
-            
-            # Save training state separately if requested
-            if self.config.save_optimizer_state:
-                state = {
-                    "global_step": self.global_step,
-                    "epoch": self.epoch,
-                    "best_metric": self.best_metric,
-                    "optimizer_state": self.optimizer.state_dict(),
-                    "scheduler_state": self.scheduler.state_dict(),
-                }
-                if self.scaler:
-                    state["scaler_state"] = self.scaler.state_dict()
-
-                torch.save(state, checkpoint_dir / "training_state.pt")
-                logger.info(f"Saved adapter checkpoint: {name} (with training state)")
-            else:
-                logger.info(f"Saved adapter checkpoint: {name} (adapter only, no training state)")
+            checkpoint_type = "adapter"
+            trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         else:
-            # Original behavior: save full model with merged weights
+            # Full model save: merge LoRA weights if present
             lora_was_merged = False
             if self.config.use_lora and self.lora_layers:
-                # Check if already merged to avoid redundant merging
                 first_lora_layer = next(iter(self.lora_layers.values()))
                 if not first_lora_layer.merged:
-                    logger.info(f"Merging LoRA weights before saving checkpoint: {name}")
                     num_merged = merge_lora_weights(self.model)
-                    logger.info(f"Merged {num_merged} LoRA layers into base model")
                     lora_was_merged = True
-                else:
-                    logger.debug("LoRA weights already merged, skipping merge")
             
             # Save the model (with merged weights if LoRA was used)
             self.model.save_pretrained(str(checkpoint_dir))
@@ -1265,7 +1219,6 @@ class GLiNER2Trainer:
             # Unmerge weights after saving to continue training with LoRA
             if lora_was_merged:
                 from gliner2.training.lora import unmerge_lora_weights
-                logger.debug("Unmerging LoRA weights to continue training")
                 unmerge_lora_weights(self.model)
             
             # Save LoRA configuration if used
@@ -1276,38 +1229,44 @@ class GLiNER2Trainer:
                     "lora_alpha": self.config.lora_alpha,
                     "lora_dropout": self.config.lora_dropout,
                     "lora_target_modules": self.config.lora_target_modules,
-                    "merged": True,  # Weights are always merged in full checkpoints
+                    "merged": True,
                 }
                 import json
                 with open(checkpoint_dir / "lora_config.json", "w") as f:
                     json.dump(lora_config_dict, f, indent=2)
-                logger.info("Saved LoRA configuration to lora_config.json")
+            
+            checkpoint_type = "full"
+            trainable_params = sum(p.numel() for p in self.model.parameters())
+        
+        save_time = time.time() - save_start
+        checkpoint_size_mb = sum(f.stat().st_size for f in checkpoint_dir.rglob('*') if f.is_file()) / (1024 * 1024)
+        
+        # World-class logging
+        logger.info(
+            f"💾 Saved {checkpoint_type} checkpoint '{name}' | "
+            f"step {self.global_step} | epoch {self.epoch + 1:.1f} | "
+            f"{trainable_params:,} params | {checkpoint_size_mb:.1f}MB | {save_time:.1f}s"
+        )
 
-            # Save training state (optimizer, scheduler, etc.) if enabled
-            if self.config.save_optimizer_state:
-                state = {
-                    "global_step": self.global_step,
-                    "epoch": self.epoch,
-                    "best_metric": self.best_metric,
-                    "optimizer_state": self.optimizer.state_dict(),
-                    "scheduler_state": self.scheduler.state_dict(),
-                }
-                if self.scaler:
-                    state["scaler_state"] = self.scaler.state_dict()
-
-                torch.save(state, checkpoint_dir / "training_state.pt")
-                logger.info(f"Saved checkpoint: {name} (with training state)")
-            else:
-                logger.info(f"Saved checkpoint: {name} (model only, no training state)")
-
+        # Save model artifacts to W&B for best and final checkpoints
         if self.wandb_run and name in ["best", "final"]:
             try:
                 import wandb
-                artifact = wandb.Artifact(f"model-{self.config.experiment_name}-{name}", type="model")
+                artifact = wandb.Artifact(
+                    name=f"model-{self.config.experiment_name}-{name}",
+                    type="model",
+                    metadata={
+                        "step": self.global_step,
+                        "epoch": self.epoch,
+                        "checkpoint_type": checkpoint_type,
+                        "params": trainable_params,
+                        "size_mb": checkpoint_size_mb,
+                    }
+                )
                 artifact.add_dir(str(checkpoint_dir))
                 self.wandb_run.log_artifact(artifact)
             except Exception as e:
-                logger.warning(f"Failed to save to wandb: {e}")
+                logger.warning(f"W&B artifact upload failed: {e}")
 
         self._cleanup_checkpoints()
 
@@ -1316,7 +1275,7 @@ class GLiNER2Trainer:
             return
 
         checkpoints = sorted(
-            [d for d in self.checkpoints_dir.iterdir() if d.is_dir() and d.name.startswith("checkpoint-")],
+            [d for d in self.output_dir.iterdir() if d.is_dir() and d.name.startswith("checkpoint-")],
             key=lambda x: x.stat().st_mtime,
         )
         protected = {"best", "final"}
@@ -1327,11 +1286,12 @@ class GLiNER2Trainer:
             shutil.rmtree(oldest)
             logger.info(f"Removed old checkpoint: {oldest.name}")
 
-    def resume_from_checkpoint(self, checkpoint_path: str):
+    def load_checkpoint(self, checkpoint_path: str):
         """
-        Resume training from a checkpoint.
+        Load model weights from a checkpoint.
         
         Handles both adapter-only and full checkpoints.
+        Note: Training always starts fresh (no optimizer/scheduler state loaded).
         """
         from gliner2.training.lora import LoRAAdapterConfig
         
@@ -1339,60 +1299,32 @@ class GLiNER2Trainer:
         
         if LoRAAdapterConfig.is_adapter_path(checkpoint_path):
             # Adapter checkpoint - load adapter onto existing model
-            logger.info(f"Loading adapter checkpoint from {checkpoint_path}")
+            logger.info(f"Loading LoRA adapter from {checkpoint_path}")
             self.model.load_adapter(checkpoint_path)
-            
-            # Update lora_layers reference
             self.lora_layers = self.model._lora_layers
         else:
             # Full model checkpoint
-            # Check if checkpoint was saved with LoRA
             lora_config_path = checkpoint_dir / "lora_config.json"
             if lora_config_path.exists():
                 import json
                 with open(lora_config_path) as f:
                     lora_config = json.load(f)
                 logger.info(
-                    f"Checkpoint was trained with LoRA (r={lora_config.get('lora_r')}, "
-                    f"alpha={lora_config.get('lora_alpha')}). Weights are merged."
+                    f"Checkpoint has LoRA config (r={lora_config.get('lora_r')}, "
+                    f"alpha={lora_config.get('lora_alpha')}, merged weights)"
                 )
-                if self.config.use_lora:
-                    logger.info(
-                        "LoRA is enabled in current config. LoRA layers will be re-applied "
-                        "on top of the loaded merged weights."
-                    )
             
             # Load model (with merged weights if it was trained with LoRA)
             self.model = self.model.__class__.from_pretrained(str(checkpoint_dir))
             self.model.to(self.device)
             
             # Re-apply LoRA if enabled in current config
-            # This creates new LoRA layers initialized from scratch
             if self.config.use_lora:
-                logger.info("Re-applying LoRA to resumed model...")
+                logger.info("Applying LoRA to loaded model...")
                 self.lora_layers = {}
                 self._setup_lora()
-
-        # Load training state if exists
-        state_path = checkpoint_dir / "training_state.pt"
-        if state_path.exists():
-            state = torch.load(state_path, map_location=self.device)
-            self.global_step = state.get("global_step", 0)
-            self.epoch = state.get("epoch", 0)
-            self.best_metric = state.get("best_metric", float('inf') if not self.config.greater_is_better else float('-inf'))
-            if self.optimizer and "optimizer_state" in state:
-                self.optimizer.load_state_dict(state["optimizer_state"])
-            if self.scheduler and "scheduler_state" in state:
-                self.scheduler.load_state_dict(state["scheduler_state"])
-            if self.scaler and "scaler_state" in state:
-                self.scaler.load_state_dict(state["scaler_state"])
-            logger.info(f"Resumed from checkpoint: {checkpoint_path} (step {self.global_step})")
-        else:
-            logger.warning(
-                f"Training state not found at {state_path}. "
-                "Starting from step 0. This is normal if checkpoint was saved with save_optimizer_state=False."
-            )
-            logger.info(f"Loaded model from checkpoint: {checkpoint_path}")
+        
+        logger.info(f"✓ Loaded checkpoint: {checkpoint_path}")
 
 
 # =============================================================================
