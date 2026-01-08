@@ -137,6 +137,20 @@ class TrainingConfig:
         Enable Weights & Biases logging.
     wandb_project : str, optional
         W&B project name.
+    report_to_mlflow : bool
+        Enable MLflow logging.
+    mlflow_tracking_uri : str, optional
+        MLflow tracking URI. If None, uses local ./mlruns.
+    mlflow_experiment_name : str, optional
+        MLflow experiment name. If None, uses config.experiment_name.
+    mlflow_run_name : str, optional
+        MLflow run name. If None, auto-generated.
+    mlflow_tags : Dict[str, str], optional
+        Tags for MLflow run.
+    mlflow_log_artifacts : bool
+        Whether to log artifacts (checkpoints) to MLflow.
+    mlflow_log_artifacts_every_n_epochs : int
+        Log artifacts every N epochs (0 = only at end).
     early_stopping : bool
         Enable early stopping.
     early_stopping_patience : int
@@ -205,6 +219,13 @@ class TrainingConfig:
     wandb_run_name: Optional[str] = None
     wandb_tags: List[str] = field(default_factory=list)
     wandb_notes: Optional[str] = None
+    report_to_mlflow: bool = False
+    mlflow_tracking_uri: Optional[str] = None
+    mlflow_experiment_name: Optional[str] = None
+    mlflow_run_name: Optional[str] = None
+    mlflow_tags: Dict[str, str] = field(default_factory=dict)
+    mlflow_log_artifacts: bool = False
+    mlflow_log_artifacts_every_n_epochs: int = 0
     early_stopping: bool = False
     early_stopping_patience: int = 3
     early_stopping_threshold: float = 0.0
@@ -541,6 +562,7 @@ class GLiNER2Trainer:
         self.scheduler = None
         self.scaler = None
         self.wandb_run = None
+        self.mlflow_run = None
         self.progress_bar = None
         
         # LoRA state
@@ -610,6 +632,66 @@ class GLiNER2Trainer:
             except ImportError:
                 logger.warning("wandb not installed. Run: pip install wandb")
                 self.config.report_to_wandb = False
+        
+        # MLflow setup
+        self.mlflow_run = None
+        if self.config.report_to_mlflow and self.is_main_process:
+            try:
+                import mlflow
+                
+                # Set tracking URI
+                if self.config.mlflow_tracking_uri:
+                    mlflow.set_tracking_uri(self.config.mlflow_tracking_uri)
+                else:
+                    # Default to local mlruns directory
+                    mlflow_dir = Path.cwd() / "mlruns"
+                    mlflow_dir.mkdir(exist_ok=True)
+                    mlflow.set_tracking_uri(f"file://{mlflow_dir.absolute()}")
+                
+                # Set experiment
+                experiment_name = self.config.mlflow_experiment_name or self.config.experiment_name
+                try:
+                    experiment = mlflow.get_experiment_by_name(experiment_name)
+                    if experiment is None:
+                        experiment_id = mlflow.create_experiment(
+                            name=experiment_name,
+                            artifact_location=str(self.output_dir / "mlflow_artifacts")
+                        )
+                    else:
+                        experiment_id = experiment.experiment_id
+                except Exception:
+                    # Fallback to default experiment
+                    experiment_id = "0"
+                
+                # Create run
+                run_name = self.config.mlflow_run_name or f"{experiment_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                self.mlflow_run = mlflow.start_run(
+                    experiment_id=experiment_id,
+                    run_name=run_name,
+                    tags={
+                        "experiment": experiment_name,
+                        "model": self.model.__class__.__name__,
+                        "created": datetime.now().isoformat(),
+                        **self.config.mlflow_tags,
+                    }
+                )
+                
+                # Log config
+                mlflow.log_params({
+                    k: str(v) if not isinstance(v, (int, float, bool, str)) else v
+                    for k, v in asdict(self.config).items()
+                    if not k.startswith("mlflow_") and not k.startswith("wandb_")
+                })
+                
+                logger.info(f"MLflow run: {self.mlflow_run.info.run_id}")
+                logger.info(f"MLflow UI: {mlflow.get_tracking_uri()}")
+                
+            except ImportError:
+                logger.warning("mlflow not installed. Run: pip install mlflow")
+                self.config.report_to_mlflow = False
+            except Exception as e:
+                logger.warning(f"Failed to initialize MLflow: {e}")
+                self.config.report_to_mlflow = False
 
     def _setup_lora(self):
         """Setup LoRA for parameter-efficient fine-tuning if enabled."""
@@ -1036,6 +1118,35 @@ class GLiNER2Trainer:
             avg_epoch_loss = self._safe_divide(epoch_loss, epoch_steps, default=0.0)
             logger.info(f"Epoch {epoch + 1}/{num_epochs} - Loss: {avg_epoch_loss:.4f}")
 
+            # MLflow: Log epoch metrics
+            if self.config.report_to_mlflow and self.is_main_process:
+                try:
+                    import mlflow
+                    mlflow.log_metrics({
+                        "epoch": epoch + 1,
+                        "epoch_loss": avg_epoch_loss,
+                        "learning_rate": self.scheduler.get_last_lr()[0],
+                    }, step=self.global_step)
+                except Exception as e:
+                    logger.warning(f"Failed to log to MLflow: {e}")
+
+            # MLflow: Log artifacts at specified interval
+            if (self.config.report_to_mlflow and self.config.mlflow_log_artifacts and 
+                self.is_main_process and self.config.mlflow_log_artifacts_every_n_epochs > 0 and
+                (epoch + 1) % self.config.mlflow_log_artifacts_every_n_epochs == 0):
+                try:
+                    import mlflow
+                    # Save a temporary checkpoint for MLflow
+                    temp_checkpoint = self.output_dir / f"mlflow_temp_epoch_{epoch + 1}"
+                    temp_checkpoint.mkdir(exist_ok=True)
+                    self._save_checkpoint_to_dir(temp_checkpoint, f"epoch-{epoch + 1}")
+                    mlflow.log_artifacts(str(temp_checkpoint), artifact_path=f"checkpoints/epoch_{epoch + 1}")
+                    # Clean up temp directory
+                    shutil.rmtree(temp_checkpoint)
+                    logger.info(f"Logged artifacts to MLflow for epoch {epoch + 1}")
+                except Exception as e:
+                    logger.warning(f"Failed to log artifacts to MLflow: {e}")
+
             if self.config.eval_strategy == "epoch":
                 if eval_dataset:
                     eval_metrics = self._evaluate(eval_dataset)
@@ -1054,11 +1165,57 @@ class GLiNER2Trainer:
 
         if self.is_main_process:
             self._save_checkpoint("final")
+            
+            # MLflow: Log final artifacts
+            if self.config.report_to_mlflow and self.config.mlflow_log_artifacts:
+                try:
+                    import mlflow
+                    # Log the final checkpoint
+                    final_checkpoint = self.output_dir / "final"
+                    if final_checkpoint.exists():
+                        mlflow.log_artifacts(str(final_checkpoint), artifact_path="checkpoints/final")
+                    
+                    # Log training config
+                    config_path = self.output_dir / "training_config.json"
+                    if config_path.exists():
+                        mlflow.log_artifact(str(config_path))
+                    
+                    # Log metrics history
+                    metrics_file = self.output_dir / "training_metrics.json"
+                    with open(metrics_file, 'w') as f:
+                        json.dump({
+                            "train_metrics": self.train_metrics_history,
+                            "eval_metrics": self.eval_metrics_history,
+                            "best_metric": self.best_metric,
+                        }, f, indent=2)
+                    mlflow.log_artifact(str(metrics_file))
+                    
+                except Exception as e:
+                    logger.warning(f"Failed to log final artifacts to MLflow: {e}")
+            
+            # MLflow: End run
+            if self.config.report_to_mlflow and self.mlflow_run:
+                try:
+                    import mlflow
+                    mlflow.log_metrics({
+                        "best_metric": self.best_metric,
+                        "total_steps": self.global_step,
+                        "total_epochs": self.epoch + 1,
+                    })
+                    mlflow.end_run()
+                    logger.info("MLflow run completed")
+                except Exception as e:
+                    logger.warning(f"Failed to end MLflow run: {e}")
+            
+            # W&B: End run
             if self.config.report_to_wandb:
-                import wandb
-                wandb.summary["best_metric"] = self.best_metric
-                wandb.summary["total_steps"] = self.global_step
-                wandb.finish()
+                try:
+                    import wandb
+                    wandb.summary["best_metric"] = self.best_metric
+                    wandb.summary["total_steps"] = self.global_step
+                    wandb.finish()
+                except Exception as e:
+                    logger.warning(f"Failed to finish W&B run: {e}")
 
         total_time = time.time() - start_time
         return {
@@ -1207,6 +1364,21 @@ class GLiNER2Trainer:
             except Exception as e:
                 logger.warning(f"Failed to log to wandb: {e}")
 
+        # MLflow logging
+        if self.config.report_to_mlflow and self.is_main_process:
+            try:
+                import mlflow
+                # Filter out NaN and Inf values for MLflow
+                mlflow_metrics = {
+                    k: v
+                    for k, v in metrics.items()
+                    if isinstance(v, (int, float)) and not (math.isnan(v) or math.isinf(v))
+                }
+                if mlflow_metrics:
+                    mlflow.log_metrics(mlflow_metrics, step=self.global_step)
+            except Exception as e:
+                logger.warning(f"Failed to log to MLflow: {e}")
+
         if prefix == "train":
             self.train_metrics_history.append(metrics)
 
@@ -1215,6 +1387,10 @@ class GLiNER2Trainer:
             return
 
         checkpoint_dir = self.output_dir / name
+        self._save_checkpoint_to_dir(checkpoint_dir, name)
+
+    def _save_checkpoint_to_dir(self, checkpoint_dir: Path, name: str):
+        """Internal method to save checkpoint to a specific directory."""
         checkpoint_dir.mkdir(exist_ok=True)
         
         save_start = time.time()
